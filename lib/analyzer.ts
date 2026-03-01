@@ -1,14 +1,12 @@
-import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { RawDeal, AnalyzedDeal, DealAnalysis } from './types';
 import { hashDeal } from './dedup';
 
-function getClient(): Anthropic {
-  return new Anthropic();
+function getClient(): OpenAI {
+  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 }
 
-const ANALYSIS_PROMPT = `You are a business acquisition analyst helping a buyer with $10,000 cash who is open to financing (seller financing, SBA loans, earnouts, revenue splits).
-
-Analyze this business listing and provide a structured assessment.
+const SYSTEM_PROMPT = `You are a business acquisition analyst helping a buyer with $10,000 cash who is open to financing (seller financing, SBA loans, earnouts, revenue splits).
 
 SCORING GUIDE:
 - 80-100: Cash flowing, affordable entry, seller financing offered, strong upside
@@ -16,6 +14,10 @@ SCORING GUIDE:
 - 40-59: Interesting but significant unknowns or risks
 - 20-39: Overpriced, unverifiable claims, or poor fit
 - 1-19: Hard pass — doesn't meet criteria
+
+You must respond ONLY in valid JSON, no markdown, no code fences, no explanation.`;
+
+const ANALYSIS_PROMPT = `Analyze this business listing and provide a structured assessment.
 
 LISTING:
 Title: {title}
@@ -29,7 +31,7 @@ Type: {businessType}
 Location: {location}
 Description: {description}
 
-Respond ONLY in this exact JSON format, no markdown, no code fences, no explanation:
+Respond ONLY in this exact JSON format:
 {"score":<1-100 integer>,"verdict":"<STRONG BUY|WORTH EXPLORING|MAYBE|PASS>","oneLiner":"<one compelling sentence about why this deal matters or doesnt>","dealStructure":"<how the buyer could realistically acquire this with $10k cash — be specific about financing approach>","monthlyProfit":<estimated monthly take-home after debt service if financed, integer>,"risks":["<risk 1>","<risk 2>","<risk 3>"],"upside":["<opportunity 1>","<opportunity 2>"],"aiAngle":"<specific way AI or automation could improve this business>","nextStep":"<exact first action the buyer should take if interested>","category":"<saas|ecommerce|content|service|franchise|local|route|real_asset|other>"}`;
 
 function buildPrompt(deal: RawDeal): string {
@@ -48,7 +50,6 @@ function buildPrompt(deal: RawDeal): string {
 
 function parseAnalysis(text: string): DealAnalysis | null {
   try {
-    // Strip any markdown code fences
     let cleaned = text.trim();
     if (cleaned.startsWith('```')) {
       cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
@@ -56,7 +57,6 @@ function parseAnalysis(text: string): DealAnalysis | null {
 
     const parsed = JSON.parse(cleaned);
 
-    // Validate required fields
     if (
       typeof parsed.score !== 'number' ||
       !parsed.verdict ||
@@ -65,22 +65,18 @@ function parseAnalysis(text: string): DealAnalysis | null {
       return null;
     }
 
-    // Clamp score
     parsed.score = Math.max(1, Math.min(100, Math.round(parsed.score)));
 
-    // Validate verdict
     const validVerdicts = ['STRONG BUY', 'WORTH EXPLORING', 'MAYBE', 'PASS'];
     if (!validVerdicts.includes(parsed.verdict)) {
       parsed.verdict = parsed.score >= 70 ? 'WORTH EXPLORING' : parsed.score >= 40 ? 'MAYBE' : 'PASS';
     }
 
-    // Validate category
     const validCategories = ['saas', 'ecommerce', 'content', 'service', 'franchise', 'local', 'route', 'real_asset', 'other'];
     if (!validCategories.includes(parsed.category)) {
       parsed.category = 'other';
     }
 
-    // Ensure arrays
     if (!Array.isArray(parsed.risks)) parsed.risks = [];
     if (!Array.isArray(parsed.upside)) parsed.upside = [];
 
@@ -94,22 +90,20 @@ export async function analyzeDeal(deal: RawDeal): Promise<AnalyzedDeal | null> {
   try {
     const prompt = buildPrompt(deal);
 
-    const response = await getClient().messages.create({
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 1024,
+    const response = await getClient().chat.completions.create({
+      model: 'gpt-4o',
       temperature: 0.3,
+      max_tokens: 1024,
       messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: prompt },
       ],
     });
 
-    const textBlock = response.content.find(b => b.type === 'text');
-    if (!textBlock || textBlock.type !== 'text') return null;
+    const text = response.choices[0]?.message?.content;
+    if (!text) return null;
 
-    const analysis = parseAnalysis(textBlock.text);
+    const analysis = parseAnalysis(text);
     if (!analysis) {
       console.error(`Failed to parse analysis for: ${deal.title}`);
       return null;
@@ -127,13 +121,11 @@ export async function analyzeDeal(deal: RawDeal): Promise<AnalyzedDeal | null> {
 }
 
 export async function analyzeDeals(deals: RawDeal[], maxDeals = 10): Promise<AnalyzedDeal[]> {
-  // Only analyze the top candidates (limit API calls)
   const toAnalyze = deals.slice(0, maxDeals);
   const analyzed: AnalyzedDeal[] = [];
 
-  console.log(`[Analyzer] Analyzing ${toAnalyze.length} deals with Claude...`);
+  console.log(`[Analyzer] Analyzing ${toAnalyze.length} deals with GPT-4o...`);
 
-  // Run analyses in batches of 3 to avoid rate limits
   const batchSize = 3;
   for (let i = 0; i < toAnalyze.length; i += batchSize) {
     const batch = toAnalyze.slice(i, i + batchSize);
@@ -147,7 +139,6 @@ export async function analyzeDeals(deals: RawDeal[], maxDeals = 10): Promise<Ana
     }
   }
 
-  // Sort by score descending
   analyzed.sort((a, b) => b.analysis.score - a.analysis.score);
 
   console.log(`[Analyzer] ${analyzed.length} deals analyzed and scored`);
@@ -156,10 +147,10 @@ export async function analyzeDeals(deals: RawDeal[], maxDeals = 10): Promise<Ana
 
 export async function generateSubjectLine(topDeal: AnalyzedDeal, totalDeals: number): Promise<string> {
   try {
-    const response = await getClient().messages.create({
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 100,
+    const response = await getClient().chat.completions.create({
+      model: 'gpt-4o-mini',
       temperature: 0.7,
+      max_tokens: 100,
       messages: [
         {
           role: 'user',
@@ -168,9 +159,9 @@ export async function generateSubjectLine(topDeal: AnalyzedDeal, totalDeals: num
       ],
     });
 
-    const textBlock = response.content.find(b => b.type === 'text');
-    if (textBlock && textBlock.type === 'text') {
-      return textBlock.text.trim().replace(/^["']|["']$/g, '');
+    const text = response.choices[0]?.message?.content;
+    if (text) {
+      return text.trim().replace(/^["']|["']$/g, '');
     }
   } catch {
     // Fallback
